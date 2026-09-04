@@ -157,16 +157,18 @@ def test_an_explicit_universal_budget_is_honoured_verbatim(monkeypatch):
     import core.device_caps as caps
     import services.model_manager as mm_mod
 
-    monkeypatch.setenv("OMNIVOICE_GENERATE_TIMEOUT_S", "123.5")
-    mm = importlib.reload(mm_mod)
-    try:
-        monkeypatch.setattr(caps, "detect_host_caps", lambda: _gpu(4.0))
+    # `monkeypatch.context()` so the environment is restored BEFORE the reload
+    # below (CodeRabbit on the PR). Deleting the var by hand and reloading
+    # inside a `finally` leaves the module constants describing an environment
+    # pytest is about to put back, and every later test reads the mismatch.
+    with monkeypatch.context() as m:
+        m.setenv("OMNIVOICE_GENERATE_TIMEOUT_S", "123.5")
+        mm = importlib.reload(mm_mod)
+        m.setattr(caps, "detect_host_caps", lambda: _gpu(4.0))
         assert mm.generate_timeout_s(
             "A short render", execution_device="cuda", min_vram_gb=FLOOR,
         ) == 123.5
-    finally:
-        monkeypatch.delenv("OMNIVOICE_GENERATE_TIMEOUT_S", raising=False)
-        importlib.reload(mm_mod)
+    importlib.reload(mm_mod)
 
 
 def test_a_raised_accelerated_budget_is_never_cut_down_to_the_cpu_one(
@@ -320,17 +322,46 @@ def test_the_task_deadline_still_covers_the_raised_execution_budget(device):
 
 def test_losing_the_worker_never_shortens_an_under_provisioned_budget():
     """`Scheduler._budget_for` recomputes with no worker once one disconnects,
-    so `under_provisioned` goes False there. That cannot shorten anything: no
+    so `under_provisioned` goes False there. That must not shorten anything: no
     worker means no `execution_device`, which `_base_execution_seconds` already
     coerces to "cpu" — the very budget the floor raises an under-provisioned
-    card to. Pinned so a future change to either default cannot quietly make
-    the orphaned recomputation the smaller of the two."""
-    from worker import deadlines
+    card to.
 
-    bound = deadlines.for_task(
-        "tts", text="short", execution_device="cuda", under_provisioned=True,
+    Driven through a real scheduler rather than the policy alone (CodeRabbit on
+    the PR): the coercion lives in the disconnect path, so a test that only
+    called `for_task` would pass even if that path stopped doing it."""
+    from worker import deadlines
+    from worker.identity import issue_session
+    from worker.pool import WorkerPool
+    from worker.scheduler import Scheduler
+
+    now = 1000.0
+    worker = _worker()  # 4 GB card, 6 GB engine
+    pool = WorkerPool()
+    pool.connect(
+        worker.record,
+        session=issue_session(
+            worker_id=worker.record.id, key_id=worker.record.key_id,
+            epoch=1, now=now,
+        ),
+        epoch=1, max_concurrent_tasks=1, backend="cuda", now=now,
     )
-    orphaned = deadlines.for_task("tts", text="short")  # what _budget_for sees
+    sched = Scheduler(pool, persist=False)
+    task = sched.submit(
+        operation="tts", engine="omnivoice", model_id="OmniVoice",
+        params={"text": "short"}, now=now,
+    )
+    assignment = sched.next_assignment(now=now)
+    assert assignment is not None, "the under-provisioned worker should still be used"
+
+    # Bound: the worker is present, so its own verdict raises the budget.
+    bound = sched._budget_for(task)
+    on_cpu = deadlines.for_task("tts", text="short", execution_device="cpu")
+    assert bound.execution_seconds == on_cpu.execution_seconds
+
+    # …and it survives the worker vanishing.
+    pool.disconnect(worker.record.id)
+    orphaned = sched._budget_for(task)
     assert orphaned.execution_seconds >= bound.execution_seconds
 
 
@@ -388,11 +419,11 @@ def test_both_budgets_explicit_leaves_the_accelerated_one_in_charge(monkeypatch)
     import core.device_caps as caps
     import services.model_manager as mm_mod
 
-    monkeypatch.setenv("OMNIVOICE_GENERATE_TIMEOUT_S", "200")
-    monkeypatch.setenv("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", "600")
-    mm = importlib.reload(mm_mod)
-    try:
-        monkeypatch.setattr(caps, "detect_host_caps", lambda: _gpu(4.0))
+    with monkeypatch.context() as m:  # see the note on the test above
+        m.setenv("OMNIVOICE_GENERATE_TIMEOUT_S", "200")
+        m.setenv("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", "600")
+        mm = importlib.reload(mm_mod)
+        m.setattr(caps, "detect_host_caps", lambda: _gpu(4.0))
         assert mm.generate_timeout_s(
             "A short render", execution_device="cuda", min_vram_gb=FLOOR,
         ) == 200.0
@@ -400,7 +431,4 @@ def test_both_budgets_explicit_leaves_the_accelerated_one_in_charge(monkeypatch)
         assert mm.generate_timeout_s(
             "A short render", execution_device="cpu",
         ) == 600.0
-    finally:
-        monkeypatch.delenv("OMNIVOICE_GENERATE_TIMEOUT_S", raising=False)
-        monkeypatch.delenv("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", raising=False)
-        importlib.reload(mm_mod)
+    importlib.reload(mm_mod)
