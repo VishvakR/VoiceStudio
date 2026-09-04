@@ -296,19 +296,42 @@ def test_a_healthy_remote_worker_is_unchanged():
     )
 
 
-def test_the_task_deadline_still_covers_the_raised_execution_budget():
+@pytest.mark.parametrize("device", ["cuda", "rocm"])
+def test_the_task_deadline_still_covers_the_raised_execution_budget(device):
     """`gpu_gateway._default_deadline` is computed before a worker is bound, so
     it cannot know the card. It already asks for the CPU budget (no
     `execution_device`), which is the larger of the two — so the ceiling the
     awaiting side grants still covers the corrected lease rather than
-    abandoning a worker that is inside its own deadline."""
+    abandoning a worker that is inside its own deadline.
+
+    Calls the gateway function itself rather than restating its formula
+    (CodeRabbit on the PR): a future change that started passing a device there
+    would pick a shorter ceiling, and a test that only re-derived the number
+    would not notice."""
+    from services import gpu_gateway
     from worker import deadlines
 
-    ceiling = deadlines.for_task("tts", text="short")
+    ceiling = gpu_gateway._default_deadline("tts", "short")
     corrected = deadlines.for_task(
+        "tts", text="short", execution_device=device, under_provisioned=True,
+    )
+    assert ceiling >= corrected.total_seconds
+
+
+def test_losing_the_worker_never_shortens_an_under_provisioned_budget():
+    """`Scheduler._budget_for` recomputes with no worker once one disconnects,
+    so `under_provisioned` goes False there. That cannot shorten anything: no
+    worker means no `execution_device`, which `_base_execution_seconds` already
+    coerces to "cpu" — the very budget the floor raises an under-provisioned
+    card to. Pinned so a future change to either default cannot quietly make
+    the orphaned recomputation the smaller of the two."""
+    from worker import deadlines
+
+    bound = deadlines.for_task(
         "tts", text="short", execution_device="cuda", under_provisioned=True,
     )
-    assert ceiling.total_seconds >= corrected.total_seconds
+    orphaned = deadlines.for_task("tts", text="short")  # what _budget_for sees
+    assert orphaned.execution_seconds >= bound.execution_seconds
 
 
 # ── the pairing, repo-wide ───────────────────────────────────────────────
@@ -337,8 +360,13 @@ def test_every_dispatch_that_tells_the_guard_its_floor_tells_the_budget_too():
             kw = {k.arg: k.value for k in call.keywords if k.arg}
             if "min_vram_gb" not in kw or "timeout" not in kw:
                 continue
+            # The SAME floor, not merely some floor: a budget computed with 0
+            # or another engine's figure would otherwise pass while the guard
+            # used the right one (CodeRabbit on the PR).
+            wanted = ast.dump(kw["min_vram_gb"])
             if not any(
                 isinstance(n, ast.keyword) and n.arg == "min_vram_gb"
+                and ast.dump(n.value) == wanted
                 for n in ast.walk(kw["timeout"])
             ):
                 offenders.append(f"{path.name}:{call.lineno}")
@@ -346,3 +374,33 @@ def test_every_dispatch_that_tells_the_guard_its_floor_tells_the_budget_too():
         "these dispatches tell the guard the engine's VRAM floor but judge the "
         f"job by a budget that ignores it (#1804): {offenders}"
     )
+
+
+def test_both_budgets_explicit_leaves_the_accelerated_one_in_charge(monkeypatch):
+    """The precedence `docs/performance.md` documents, pinned.
+
+    Filling in BOTH Settings rows is the case #1787 had to disambiguate for CPU
+    hosts. For an under-provisioned GPU the accelerated value wins: the host is
+    still accelerated, so the number the user chose for accelerated hosts is
+    used verbatim rather than floored — which is what keeps "lower it to fail
+    fast everywhere" working.
+    """
+    import core.device_caps as caps
+    import services.model_manager as mm_mod
+
+    monkeypatch.setenv("OMNIVOICE_GENERATE_TIMEOUT_S", "200")
+    monkeypatch.setenv("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", "600")
+    mm = importlib.reload(mm_mod)
+    try:
+        monkeypatch.setattr(caps, "detect_host_caps", lambda: _gpu(4.0))
+        assert mm.generate_timeout_s(
+            "A short render", execution_device="cuda", min_vram_gb=FLOOR,
+        ) == 200.0
+        # …while a CPU dispatch still gets the CPU row it was told it would.
+        assert mm.generate_timeout_s(
+            "A short render", execution_device="cpu",
+        ) == 600.0
+    finally:
+        monkeypatch.delenv("OMNIVOICE_GENERATE_TIMEOUT_S", raising=False)
+        monkeypatch.delenv("OMNIVOICE_CPU_GENERATE_TIMEOUT_S", raising=False)
+        importlib.reload(mm_mod)
