@@ -166,17 +166,46 @@ def test_the_generate_call_sites_pass_the_engines_floor():
     job is judged against. Only the first existed, so a 4 GB card could be told
     exactly why it timed out by a watchdog that had given it the fast-hardware
     budget in the first place."""
+    import ast
     import inspect
 
     from api.routers import generation
 
     src = inspect.getsource(generation)
-    dispatches = src.count('what="TTS generate",')
-    assert dispatches >= 5, "call-site scan found suspiciously few dispatches"
-    assert src.count("min_vram_gb=_engine_min_vram_gb") == 2 * dispatches, (
-        "every TTS generate dispatch must pass the engine's floor to BOTH the "
-        "guard (which uses it to name the card) and the budget (#1804)"
-    )
+    tree = ast.parse(src)
+
+    def _kw(call, name):
+        return next((k for k in call.keywords if k.arg == name), None)
+
+    def _names_floor(node) -> bool:
+        return any(
+            isinstance(n, ast.Name) and n.id == "_engine_min_vram_gb"
+            for n in ast.walk(node)
+        )
+
+    dispatches = [
+        call for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and (kw := _kw(call, "what")) is not None
+        and isinstance(kw.value, ast.Constant)
+        and kw.value.value == "TTS generate"
+    ]
+    assert len(dispatches) >= 5, "call-site scan found suspiciously few dispatches"
+
+    # Per dispatch, not a global tally: counting occurrences lets one call site
+    # drop both arguments while another gains an extra and the total still
+    # matches (CodeRabbit, #1806).
+    for call in dispatches:
+        where = f"{generation.__name__}:{call.lineno}"
+        guard = _kw(call, "min_vram_gb")
+        assert guard is not None and _names_floor(guard.value), (
+            f"{where}: the guard needs the engine's floor to name the card"
+        )
+        budget = _kw(call, "timeout")
+        assert budget is not None and _names_floor(budget.value), (
+            f"{where}: the BUDGET needs the engine's floor too, or a card that "
+            f"renders slower than CPU is judged by the accelerated one (#1804)"
+        )
 
 
 def test_timeout_message_unchanged_on_cpu(monkeypatch):

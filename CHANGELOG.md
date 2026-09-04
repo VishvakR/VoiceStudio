@@ -20,7 +20,7 @@ the frozen-backend fallback mirror it for their toolchains.
 
 ### Fixed
 
-- A GPU with less VRAM than the engine needs now gets the CPU compute-time budget instead of the shorter accelerated one, since it pages to system RAM and renders slower than the CPU would (#1804)
+- A CUDA or ROCm GPU with less VRAM than the engine needs now gets the CPU compute-time budget instead of the shorter accelerated one, since it pages to system RAM and renders slower than the CPU would — applied to local generation, voice conversion, and remote worker deadlines alike (#1804)
 
 
 ## [0.5.2] — 2026-09-02

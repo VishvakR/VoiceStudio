@@ -207,3 +207,142 @@ def test_the_budget_and_the_caveat_read_the_same_verdict(caps, expected):
 def test_an_undeclared_floor_and_a_missing_probe_are_both_silent():
     assert under_provisioned_vram(_gpu(4.0), 0.0) is False
     assert under_provisioned_vram(None, FLOOR) is False
+
+
+# ── the remote half: a small card on a WORKER ────────────────────────────
+#
+# Greptile P1 on the PR. The control plane sets a remote attempt's deadline, so
+# the same inversion applies there — but it cannot be fixed by handing
+# `generate_timeout_s()` the engine floor: that function probes THIS host, and
+# the control plane's hardware is not the worker's. A Mac control plane
+# dispatching to a 4 GB Windows box would learn nothing (MPS is excluded), and a
+# 4 GB box dispatching to a 24 GB worker would wrongly get the longer budget.
+# The worker already advertises both figures, so it is the one that decides.
+
+
+def _worker(*, backend: str = "cuda", vram_gb: float = 4.0,
+            floor_gb: float = 6.0, cpu_fallback: bool = False):
+    from worker.capacity import WorkerCapacity
+    from worker.pool import ConnectedWorker
+    from worker.registry import RemoteWorker
+
+    gb = 1024 ** 3
+    record = RemoteWorker(
+        id="w1", name="w1", key_id="key-w1", public_key=b"\x00" * 32, priority=50,
+        capabilities=[{
+            "engine": "omnivoice",
+            "model_id": "OmniVoice",
+            "operations": ["tts"],
+            "supported": True,
+            "installed": True,
+            "downloaded": True,
+            "backend": backend,
+            "cpu_fallback": cpu_fallback,
+            "min_memory_bytes": int(floor_gb * gb),
+            "free_memory_bytes": int(vram_gb * gb),
+        }],
+        consent_granted_at=1.0, created_at=1.0,
+    )
+    return ConnectedWorker(
+        record=record, session=None, epoch=1,
+        capacity=WorkerCapacity(worker_id="w1", max_concurrent_tasks=1,
+                                backend=backend),
+        connected_at=0.0, last_heartbeat_at=0.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs, expected",
+    [
+        ({}, True),                                   # 4 GB card, 6 GB engine
+        ({"backend": "rocm"}, True),                  # whole class
+        ({"vram_gb": 24.0}, False),                   # big card
+        ({"floor_gb": 0.0}, False),                   # engine declares no floor
+        ({"vram_gb": 0.0}, False),                    # probe failed on the worker
+        ({"backend": "mps"}, False),                  # unified memory
+        ({"cpu_fallback": True}, False),              # already routed to CPU
+    ],
+)
+def test_the_worker_decides_from_the_figures_it_advertises(kwargs, expected):
+    w = _worker(**kwargs)
+    assert w.under_provisioned("omnivoice", "OmniVoice", "tts") is expected
+
+
+def test_an_unknown_capability_is_never_called_under_provisioned():
+    w = _worker()
+    assert w.under_provisioned("some-other-engine", "", "tts") is False
+
+
+def test_a_remote_attempt_on_a_small_card_gets_the_cpu_execution_budget():
+    from worker import deadlines
+
+    accelerated = deadlines.for_task("tts", text="short", execution_device="cuda")
+    corrected = deadlines.for_task(
+        "tts", text="short", execution_device="cuda", under_provisioned=True,
+    )
+    on_cpu = deadlines.for_task("tts", text="short", execution_device="cpu")
+    assert accelerated.execution_seconds < corrected.execution_seconds
+    assert corrected.execution_seconds == on_cpu.execution_seconds
+
+
+def test_a_healthy_remote_worker_is_unchanged():
+    from worker import deadlines
+
+    assert (
+        deadlines.for_task("tts", text="short", execution_device="cuda").execution_seconds
+        == deadlines.for_task(
+            "tts", text="short", execution_device="cuda", under_provisioned=False,
+        ).execution_seconds
+    )
+
+
+def test_the_task_deadline_still_covers_the_raised_execution_budget():
+    """`gpu_gateway._default_deadline` is computed before a worker is bound, so
+    it cannot know the card. It already asks for the CPU budget (no
+    `execution_device`), which is the larger of the two — so the ceiling the
+    awaiting side grants still covers the corrected lease rather than
+    abandoning a worker that is inside its own deadline."""
+    from worker import deadlines
+
+    ceiling = deadlines.for_task("tts", text="short")
+    corrected = deadlines.for_task(
+        "tts", text="short", execution_device="cuda", under_provisioned=True,
+    )
+    assert ceiling.total_seconds >= corrected.total_seconds
+
+
+# ── the pairing, repo-wide ───────────────────────────────────────────────
+
+
+def test_every_dispatch_that_tells_the_guard_its_floor_tells_the_budget_too():
+    """The class, not the instance.
+
+    `/generate` was the reported one and `/convert` had the identical split
+    (CodeRabbit on the PR): both handed the guard `min_vram_gb` so a timeout
+    could name the card, and both computed the budget without it. Rather than
+    one test per router, this is the rule — if a dispatch knows the engine's
+    floor well enough to explain the timeout, it knows it well enough to set
+    the budget. A new router that forgets fails here.
+    """
+    import ast
+    import pathlib
+
+    routers = pathlib.Path(__file__).resolve().parents[1] / "backend" / "api" / "routers"
+    offenders = []
+    for path in sorted(routers.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call):
+                continue
+            kw = {k.arg: k.value for k in call.keywords if k.arg}
+            if "min_vram_gb" not in kw or "timeout" not in kw:
+                continue
+            if not any(
+                isinstance(n, ast.keyword) and n.arg == "min_vram_gb"
+                for n in ast.walk(kw["timeout"])
+            ):
+                offenders.append(f"{path.name}:{call.lineno}")
+    assert not offenders, (
+        "these dispatches tell the guard the engine's VRAM floor but judge the "
+        f"job by a budget that ignores it (#1804): {offenders}"
+    )
