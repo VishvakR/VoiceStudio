@@ -159,15 +159,24 @@ def test_a_job_with_no_declared_floor_is_never_diagnosed_as_under_provisioned(
 
 def test_the_generate_call_sites_pass_the_engines_floor():
     """...and the TTS generate dispatches DO opt in — otherwise the branch
-    above is unreachable in production."""
+    above is unreachable in production.
+
+    Each dispatch names the floor TWICE (#1804): once for the guard, whose
+    message diagnoses the timeout after the fact, and once inside the budget the
+    job is judged against. Only the first existed, so a 4 GB card could be told
+    exactly why it timed out by a watchdog that had given it the fast-hardware
+    budget in the first place."""
     import inspect
 
     from api.routers import generation
 
     src = inspect.getsource(generation)
-    assert src.count("min_vram_gb=_engine_min_vram_gb") == src.count(
-        'what="TTS generate",'
-    ), "every TTS generate dispatch must pass the engine's floor"
+    dispatches = src.count('what="TTS generate",')
+    assert dispatches >= 5, "call-site scan found suspiciously few dispatches"
+    assert src.count("min_vram_gb=_engine_min_vram_gb") == 2 * dispatches, (
+        "every TTS generate dispatch must pass the engine's floor to BOTH the "
+        "guard (which uses it to name the card) and the budget (#1804)"
+    )
 
 
 def test_timeout_message_unchanged_on_cpu(monkeypatch):
